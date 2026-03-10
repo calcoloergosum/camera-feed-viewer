@@ -1,0 +1,14 @@
+We will build the camera-viewing UI as a web application using React + PixiJS. The browser will display the live camera feed in a video element, and overlays such as polygons, labels, and heat maps will be rendered in a separate graphics layer on top. This is preferable to trying to embed overlays into the video itself, because it keeps the system modular, easier to maintain, and more efficient.
+The architecture should treat video and overlay data as separate streams. The camera feed should be delivered as a compressed media stream, not as raw image frames over ordinary HTTP requests. For local camera access inside the same browser, getUserMedia() is sufficient and avoids network transport entirely. For remote low-latency viewing, WebRTC is the preferred transport. For higher-scale distribution where some delay is acceptable, HLS/DASH via MSE is a reasonable alternative.
+To cope with payload size, the system should avoid sending rendered overlays as pixels. Instead, it should send only lightweight metadata such as polygon coordinates, detection boxes, labels, or heatmap values, and let the browser render those overlays locally. This keeps bandwidth low and avoids duplicating visual information already present in the video stream.
+The recommended frontend stack is:
+- React for application structure and UI state
+- PixiJS for high-performance overlay rendering
+- Native browser media APIs such as getUserMedia() and <video> for camera playback
+- Optional WebSocket or WebRTC data channel for real-time overlay metadata
+
+The target UI structure is:
+bottom layer: live video
+top layer: transparent PixiJS canvas for overlays
+optional hidden processing layer if future CV analysis is added
+This approach is suitable because PixiJS handles heavier visual workloads better than plain canvas when rendering many objects, animated heat maps, blending effects, or other GPU-friendly graphics. Overall, the plan is to use compressed streaming for video, metadata for overlays, and browser-side rendering for composition.

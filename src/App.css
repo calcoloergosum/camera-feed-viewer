@@ -1,0 +1,244 @@
+.app-shell {
+  width: min(1120px, 100% - 2rem);
+  margin: 0 auto;
+  padding: 1.4rem 0 1.8rem;
+}
+
+.hero {
+  margin-bottom: 1rem;
+}
+
+.kicker {
+  display: inline-block;
+  margin: 0;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  background: #204567;
+  color: #b6ddff;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.hero h1 {
+  margin: 0.45rem 0 0.35rem;
+  font-size: clamp(1.55rem, 3.2vw, 2.35rem);
+  letter-spacing: -0.015em;
+}
+
+.hero p {
+  margin: 0;
+  max-width: 70ch;
+  color: #c6d9ea;
+}
+
+.control-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-top: 1rem;
+  margin-bottom: 0.85rem;
+}
+
+.action-btn {
+  border: none;
+  border-radius: 11px;
+  padding: 0.62rem 0.95rem;
+  font-size: 0.95rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, #ffe97a 0%, #ffb74a 60%, #ff7a3b 100%);
+  color: #1f1a13;
+  cursor: pointer;
+  transition: transform 180ms ease, box-shadow 180ms ease;
+}
+
+.action-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 26px rgba(255, 152, 58, 0.3);
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  border-radius: 999px;
+  padding: 0.5rem 0.8rem;
+  background: rgba(13, 26, 40, 0.88);
+  border: 1px solid rgba(127, 156, 181, 0.24);
+  color: #d2e6f6;
+  font-size: 0.88rem;
+}
+
+.error-banner {
+  margin: 0 0 0.8rem;
+  border: 1px solid rgba(255, 131, 131, 0.4);
+  background: rgba(121, 26, 26, 0.3);
+  color: #ffd8d8;
+  border-radius: 10px;
+  padding: 0.65rem 0.8rem;
+}
+
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.7rem;
+  margin-bottom: 0.8rem;
+}
+
+.diagnostics-grid article {
+  background: rgba(12, 24, 37, 0.88);
+  border: 1px solid rgba(127, 156, 181, 0.24);
+  border-radius: 11px;
+  padding: 0.58rem 0.72rem;
+}
+
+.diagnostics-grid h2 {
+  margin: 0;
+  font-size: 0.74rem;
+  color: #9cbad3;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.diagnostics-grid p {
+  margin: 0.34rem 0 0;
+  color: #eaf2ff;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.stage-wrap {
+  margin-bottom: 1rem;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border-radius: 16px;
+  overflow: hidden;
+  background:
+    linear-gradient(rgba(75, 120, 146, 0.14), rgba(75, 120, 146, 0.04)),
+    repeating-linear-gradient(
+      45deg,
+      rgba(255, 255, 255, 0.03) 0,
+      rgba(255, 255, 255, 0.03) 6px,
+      rgba(255, 255, 255, 0) 6px,
+      rgba(255, 255, 255, 0) 12px
+    ),
+    #04070d;
+  border: 1px solid rgba(125, 157, 182, 0.35);
+  box-shadow:
+    0 28px 44px rgba(0, 0, 0, 0.44),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+}
+
+.camera-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background-color: #03060d;
+}
+
+.overlay-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.stage-fallback {
+  position: absolute;
+  inset: auto 1rem 1rem 1rem;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 186, 105, 0.4);
+  background: rgba(34, 19, 6, 0.88);
+  color: #ffe4c6;
+  padding: 0.7rem 0.8rem;
+}
+
+.stage-fallback h2 {
+  margin: 0;
+  font-size: 0.98rem;
+}
+
+.stage-fallback p {
+  margin: 0.35rem 0 0.55rem;
+  color: #ffcf9f;
+  font-size: 0.88rem;
+}
+
+.retry-btn {
+  border: none;
+  border-radius: 8px;
+  padding: 0.5rem 0.75rem;
+  font-weight: 700;
+  font-size: 0.86rem;
+  cursor: pointer;
+  color: #1f1a13;
+  background: linear-gradient(135deg, #ffe97a 0%, #ffb74a 60%, #ff7a3b 100%);
+}
+
+.metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.7rem;
+}
+
+.metrics-grid article {
+  background: linear-gradient(145deg, rgba(21, 35, 51, 0.92), rgba(11, 20, 30, 0.94));
+  border: 1px solid rgba(131, 161, 188, 0.2);
+  border-radius: 12px;
+  padding: 0.72rem 0.8rem;
+}
+
+.metrics-grid h2 {
+  margin: 0;
+  font-size: 0.8rem;
+  color: #9cbad3;
+  font-weight: 600;
+}
+
+.metrics-grid p {
+  margin: 0.4rem 0 0;
+  font-size: 1.3rem;
+  letter-spacing: -0.02em;
+  color: #e9f3ff;
+}
+
+.footnote {
+  margin: 0.9rem 0 0;
+  color: #9cb4cb;
+  font-size: 0.88rem;
+}
+
+@media (max-width: 900px) {
+  .diagnostics-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .metrics-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .app-shell {
+    width: min(1120px, 100% - 1rem);
+    padding-top: 1rem;
+  }
+
+  .control-strip {
+    gap: 0.5rem;
+  }
+
+  .status-pill {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
