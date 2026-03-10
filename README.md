@@ -43,10 +43,17 @@ Build for production:
 npm run build
 ```
 
-## Backend (Camera via cv2.VideoCapture)
+## Backend (Plugin Mode: External Camera Owner)
 
-The backend captures frames from camera using OpenCV (`cv2.VideoCapture`) when available.
-If camera open fails and `CAMERA_SOURCE=auto`, it falls back to random NumPy frames.
+Core backend runtime no longer owns camera capture. It expects an external owner
+script/process to capture frames and push them through the in-process callback
+returned by `backend.app.plugin_api.get_frame_callback(...)`.
+
+Legacy behavior can still be emulated with the harness script:
+
+```bash
+.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8000
+```
 
 Endpoints:
 
@@ -62,18 +69,26 @@ Synchronization fields:
 
 Current frontend display path uses `GET /stream.mjpeg` with `fps=30` target.
 
+Plugin callback contract (external owner -> backend):
+
+- `on_camera_frame(frame, seq=None, timestamp_ms=None, stream_id='default')`
+- `frame`: RGB NumPy array shaped `(height, width, 3)`
+- `seq`: monotonically increasing frame sequence number from owner
+- `timestamp_ms`: epoch ms timestamp for capture time
+- `stream_id`: optional source identifier
+
 One-shot stream profile presets:
 
 ```bash
-STREAM_PROFILE=low .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+STREAM_PROFILE=low .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ```bash
-STREAM_PROFILE=balanced .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+STREAM_PROFILE=balanced .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ```bash
-STREAM_PROFILE=high .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+STREAM_PROFILE=high .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Profile defaults:
@@ -85,31 +100,29 @@ Profile defaults:
 Optional backend FPS override:
 
 ```bash
-STREAM_FPS=30 .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+STREAM_FPS=30 .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
 Metadata stream FPS override:
 
 ```bash
-METADATA_FPS=10 .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+METADATA_FPS=10 .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Camera source options:
+Legacy harness source options:
 
 ```bash
-CAMERA_SOURCE=cv2 CAMERA_INDEX=0 FRAME_WIDTH=1280 FRAME_HEIGHT=720 STREAM_FPS=30 \
-.venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python backend/scripts/main.py --source cv2 --camera-index 0 --width 1280 --height 720 --fps 30 --host 127.0.0.1 --port 8000
 ```
 
 ```bash
-CAMERA_SOURCE=auto .venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8000
 ```
 
-Smoothness tuning (when feed feels choppy):
+Legacy harness smoothness tuning (when feed feels choppy):
 
 ```bash
-CAMERA_SOURCE=cv2 CAMERA_INDEX=0 FRAME_WIDTH=960 FRAME_HEIGHT=540 STREAM_FPS=24 JPEG_QUALITY=70 \
-.venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python backend/scripts/main.py --source cv2 --camera-index 0 --width 960 --height 540 --fps 24 --host 127.0.0.1 --port 8000
 ```
 
 Notes:
@@ -130,6 +143,24 @@ Synchronization validation (induced jitter + burst pauses):
 .venv/bin/python backend/scripts/validate_sync.py --base-url http://127.0.0.1:8000 --samples 100 --probe-every 10 --jitter-ms 90 --burst-every 25 --burst-pause-ms 220
 ```
 
+Plugin-empty synchronization preflight (no owner attached):
+
+```bash
+.venv/bin/python backend/scripts/validate_sync.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
+```
+
+Backend smoke check (health + frame headers + metadata WS contract):
+
+```bash
+.venv/bin/python backend/scripts/smoke_check.py --base-url http://127.0.0.1:8000
+```
+
+Plugin-empty smoke check (expects waiting state + frame 503 + no metadata messages):
+
+```bash
+.venv/bin/python backend/scripts/smoke_check.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
+```
+
 Install backend dependencies:
 
 ```bash
@@ -142,8 +173,12 @@ is present in the environment.
 Run backend API:
 
 ```bash
-.venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
 ```
+
+Important: running backend API alone in plugin mode does not ingest frames.
+If no external owner feeds `on_camera_frame`, `/frame.jpg` returns `503` and
+metadata stream waits for first frame.
 
 Quick checks:
 
@@ -163,5 +198,37 @@ If `Backend feed` stays on `connecting`, the backend is usually not running or n
 reachable at the configured URL. Start it with:
 
 ```bash
-.venv/bin/python -m uvicorn backend.app.main:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
+```
+
+## Operational Runbook
+
+Preferred local startup sequence:
+
+1. Start external owner (for example `main.py`) so callback ingestion is active.
+2. Start backend API.
+3. Run smoke check once backend starts.
+4. Start frontend with matching `VITE_BACKEND_BASE_URL`.
+
+Port recovery strategy:
+
+- If `8000` is busy, start backend on another port (for example `8014`) and export matching frontend base URL.
+- Example:
+
+```bash
+.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8014
+VITE_BACKEND_BASE_URL=http://127.0.0.1:8014 npm run dev
+```
+
+Key Stage E health metrics:
+
+- `capture_read_ms_estimate`
+- `capture_encode_ms_estimate`
+- `delivery.snapshot|mjpeg|metadata.throughput_mbps_estimate`
+- `overlay_lag_proxy_ms_estimate`
+
+Periodic backend metric logs can be tuned with:
+
+```bash
+METRICS_LOG_INTERVAL_SEC=10 LOG_LEVEL=INFO .venv/bin/python -m uvicorn backend.app.server:app --host 127.0.0.1 --port 8000
 ```
