@@ -1,17 +1,44 @@
 # Video Server
 
-React + PixiJS frontend and Python backend for camera video plus metadata overlays.
+Plugin-first camera streaming platform with synchronized overlay rendering.
 
-## Frontend
+The project delivers a React + PixiJS frontend and a FastAPI backend where camera ownership stays external to the API process. The backend serves JPEG snapshots, MJPEG stream delivery, and websocket metadata with sequence/timestamp context for sync.
 
-Frontend no longer opens a local browser camera. It reads camera frames only from
-the backend endpoints.
+## What This Delivers
 
-Frontend resilience features:
+- Backend-first video delivery for frontend playback (no browser `getUserMedia` path).
+- Plugin callback ingestion contract for external camera owners.
+- Synchronization contract across frame headers and metadata messages.
+- Frontend reconnect/backoff behavior with diagnostics and manual retry control.
+- Health, smoke, sync, and benchmark tooling for repeatable validation.
 
-- Automatic reconnect with exponential backoff when backend feed is unavailable.
-- Diagnostics panel with backend URL, reconnect attempts, and last successful frame time.
-- In-stage fallback state with manual `Retry now` action.
+## Architecture
+
+### Data Flow
+
+1. External owner captures RGB frames.
+2. Owner pushes each frame into backend callback (`on_camera_frame`).
+3. Backend stores latest encoded JPEG and frame context (seq/timestamp/shape).
+4. Frontend reads `GET /stream.mjpeg` for video and `WS /ws/metadata` for overlays.
+5. Frontend sync selector matches metadata frame timing to video timeline.
+
+### Core Interfaces
+
+- `GET /health`
+- `GET /frame.jpg`
+- `GET /stream.mjpeg`
+- `WS /ws/metadata`
+- `backend.app.plugin_api.get_frame_callback(...)`
+
+## Repository Layout
+
+- `src/`: React frontend and PixiJS overlay rendering.
+- `backend/app/`: FastAPI runtime, frame store, telemetry, plugin API.
+- `backend/scripts/`: harness, smoke check, sync validator, benchmark.
+
+## Quick Start
+
+## 1) Frontend
 
 Install dependencies:
 
@@ -19,147 +46,26 @@ Install dependencies:
 npm install
 ```
 
-Run development server:
+Run dev server:
 
 ```bash
 npm run dev
 ```
 
-Optional backend URL override:
+Optional frontend overrides:
 
 ```bash
 VITE_BACKEND_BASE_URL=http://127.0.0.1:8000 npm run dev
-```
-
-Optional sync tuning overrides:
-
-```bash
 VITE_SYNC_TOLERANCE_MS=220 VITE_SYNC_MAX_AGE_MS=2500 npm run dev
 ```
 
-Build for production:
+Build and lint:
 
 ```bash
-npm run build
+npm run lint && npm run build
 ```
 
-## Backend (Plugin Mode: External Camera Owner)
-
-Core backend runtime no longer owns camera capture. It expects an external owner
-script/process to capture frames and push them through the in-process callback
-returned by `backend.app.plugin_api.get_frame_callback(...)`.
-
-Legacy behavior can still be emulated with the harness script:
-
-```bash
-.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8000
-```
-
-Endpoints:
-
-- `GET /health`
-- `GET /frame.jpg` (single JPEG)
-- `GET /stream.mjpeg` (continuous MJPEG stream)
-- `WS /ws/metadata` (overlay metadata stream)
-
-Synchronization fields:
-
-- `GET /frame.jpg` includes `X-Frame-Seq` and `X-Frame-Timestamp-Ms` headers.
-- `WS /ws/metadata` emits `timestampMs`, `serverTimestampMs`, and `frameSeq` for alignment.
-
-Current frontend display path uses `GET /stream.mjpeg` with `fps=30` target.
-
-Plugin callback contract (external owner -> backend):
-
-- `on_camera_frame(frame, seq=None, timestamp_ms=None, stream_id='default')`
-- `frame`: RGB NumPy array shaped `(height, width, 3)`
-- `seq`: monotonically increasing frame sequence number from owner
-- `timestamp_ms`: epoch ms timestamp for capture time
-- `stream_id`: optional source identifier
-
-One-shot stream profile presets:
-
-```bash
-STREAM_PROFILE=low .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
-```
-
-```bash
-STREAM_PROFILE=balanced .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
-```
-
-```bash
-STREAM_PROFILE=high .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
-```
-
-Profile defaults:
-
-- `low`: 960x540, 24fps, JPEG quality 70
-- `balanced`: 1280x720, 30fps, JPEG quality 75
-- `high`: 1920x1080, 30fps, JPEG quality 82
-
-Optional backend FPS override:
-
-```bash
-STREAM_FPS=30 .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
-```
-
-Metadata stream FPS override:
-
-```bash
-METADATA_FPS=10 .venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
-```
-
-Legacy harness source options:
-
-```bash
-.venv/bin/python backend/scripts/main.py --source cv2 --camera-index 0 --width 1280 --height 720 --fps 30 --host 127.0.0.1 --port 8000
-```
-
-```bash
-.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8000
-```
-
-Legacy harness smoothness tuning (when feed feels choppy):
-
-```bash
-.venv/bin/python backend/scripts/main.py --source cv2 --camera-index 0 --width 960 --height 540 --fps 24 --host 127.0.0.1 --port 8000
-```
-
-Notes:
-
-- `Metadata frames dropped` in UI is metadata channel drop count, not video drop count.
-- Check `/health` for `capture_fps_estimate`, `delivery`, and `latest_frame_age_ms` when diagnosing choppy playback.
-- Check `/health` field `latest_frame_timestamp_ms` when validating sync alignment.
-
-Benchmark script (effective frame delivery and latency):
-
-```bash
-.venv/bin/python backend/scripts/benchmark_stream.py --base-url http://127.0.0.1:8000 --duration 20 --interval 0.02
-```
-
-Synchronization validation (induced jitter + burst pauses):
-
-```bash
-.venv/bin/python backend/scripts/validate_sync.py --base-url http://127.0.0.1:8000 --samples 100 --probe-every 10 --jitter-ms 90 --burst-every 25 --burst-pause-ms 220
-```
-
-Plugin-empty synchronization preflight (no owner attached):
-
-```bash
-.venv/bin/python backend/scripts/validate_sync.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
-```
-
-Backend smoke check (health + frame headers + metadata WS contract):
-
-```bash
-.venv/bin/python backend/scripts/smoke_check.py --base-url http://127.0.0.1:8000
-```
-
-Plugin-empty smoke check (expects waiting state + frame 503 + no metadata messages):
-
-```bash
-.venv/bin/python backend/scripts/smoke_check.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
-```
+## 2) Backend
 
 Install backend dependencies:
 
@@ -167,68 +73,168 @@ Install backend dependencies:
 .venv/bin/python -m pip install -r backend/requirements.txt
 ```
 
-If `ws/metadata` does not connect, reinstall requirements to ensure `websockets`
-is present in the environment.
-
-Run backend API:
+Run backend API (plugin mode):
 
 ```bash
-.venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Important: running backend API alone in plugin mode does not ingest frames.
-If no external owner feeds `on_camera_frame`, `/frame.jpg` returns `503` and
-metadata stream waits for first frame.
+Important behavior in plugin mode:
 
-Quick checks:
+- Backend does not own camera capture.
+- Before first frame ingestion, `/frame.jpg` returns `503`.
+- Metadata websocket waits for first valid frame.
+
+## 3) Legacy Owner Harness (for local integration)
+
+Use the harness to emulate an external owner process that captures and feeds frames:
 
 ```bash
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/frame.jpg -o /tmp/frame.jpg
-open http://127.0.0.1:8000/stream.mjpeg
+.venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8000
 ```
 
-If the frontend shows `Metadata frames received: 0`, verify:
-
-- Backend is running (`uvicorn` command above).
-- `http://127.0.0.1:8000/health` returns JSON.
-- Frontend uses the same backend URL (set `VITE_BACKEND_BASE_URL` when needed).
-
-If `Backend feed` stays on `connecting`, the backend is usually not running or not
-reachable at the configured URL. Start it with:
+Optional source modes:
 
 ```bash
-.venv/bin/python -m uvicorn backend.app.server:app --reload --host 0.0.0.0 --port 8000
+.venv/bin/python backend/scripts/main.py --source cv2 --camera-index 0 --width 1280 --height 720 --fps 30 --host 127.0.0.1 --port 8000
+.venv/bin/python backend/scripts/main.py --source random --width 1280 --height 720 --fps 30 --host 127.0.0.1 --port 8000
+```
+
+## Plugin Contract
+
+External camera owner calls:
+
+```python
+on_camera_frame(frame, seq=None, timestamp_ms=None, stream_id="default")
+```
+
+Contract details:
+
+- `frame`: RGB `numpy.ndarray`, shape `(height, width, 3)`.
+- `seq`: monotonically increasing sequence id from owner.
+- `timestamp_ms`: capture time as epoch milliseconds.
+- `stream_id`: optional source identifier.
+
+Get callback from backend runtime:
+
+```python
+from backend.app.plugin_api import get_frame_callback
+from backend.app.server import app
+
+frame_callback = get_frame_callback(app)
+```
+
+## Synchronization Contract
+
+### Frame Endpoint
+
+`GET /frame.jpg` includes:
+
+- `X-Frame-Seq`
+- `X-Frame-Timestamp-Ms`
+
+### Metadata Websocket
+
+`WS /ws/metadata` emits:
+
+- `timestampMs`
+- `serverTimestampMs`
+- `frameSeq`
+- `items`
+
+Frontend uses these fields to align metadata to the current video timeline and choose the nearest valid overlay frame within configurable tolerance and max-age windows.
+
+## Stream Profiles And Env Tuning
+
+Profiles:
+
+- `low`: `960x540`, `24 fps`, JPEG quality `70`
+- `balanced`: `1280x720`, `30 fps`, JPEG quality `75`
+- `high`: `1920x1080`, `30 fps`, JPEG quality `82`
+
+Example profile startup:
+
+```bash
+STREAM_PROFILE=balanced .venv/bin/python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+```
+
+Common backend env overrides:
+
+- `STREAM_FPS`
+- `FRAME_WIDTH`
+- `FRAME_HEIGHT`
+- `JPEG_QUALITY`
+- `METADATA_FPS`
+- `METRICS_LOG_INTERVAL_SEC`
+- `LOG_LEVEL`
+
+## Validation Toolkit
+
+Smoke checks:
+
+```bash
+.venv/bin/python backend/scripts/smoke_check.py --base-url http://127.0.0.1:8000
+.venv/bin/python backend/scripts/smoke_check.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
+```
+
+Sync validation:
+
+```bash
+.venv/bin/python backend/scripts/validate_sync.py --base-url http://127.0.0.1:8000 --samples 100 --probe-every 10 --jitter-ms 90 --burst-every 25 --burst-pause-ms 220
+.venv/bin/python backend/scripts/validate_sync.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
+```
+
+Benchmarking:
+
+```bash
+.venv/bin/python backend/scripts/benchmark_stream.py --base-url http://127.0.0.1:8000 --duration 20 --interval 0.02
+```
+
+Bytecode compile checks:
+
+```bash
+.venv/bin/python -m compileall backend/app backend/scripts
 ```
 
 ## Operational Runbook
 
-Preferred local startup sequence:
+Preferred startup order:
 
-1. Start external owner (for example `main.py`) so callback ingestion is active.
+1. Start external owner (or harness).
 2. Start backend API.
-3. Run smoke check once backend starts.
-4. Start frontend with matching `VITE_BACKEND_BASE_URL`.
+3. Run smoke check.
+4. Start frontend with matching backend base URL.
 
-Port recovery strategy:
-
-- If `8000` is busy, start backend on another port (for example `8014`) and export matching frontend base URL.
-- Example:
+Port recovery pattern:
 
 ```bash
 .venv/bin/python backend/scripts/main.py --source auto --host 127.0.0.1 --port 8014
 VITE_BACKEND_BASE_URL=http://127.0.0.1:8014 npm run dev
 ```
 
-Key Stage E health metrics:
+## Troubleshooting
 
-- `capture_read_ms_estimate`
-- `capture_encode_ms_estimate`
-- `delivery.snapshot|mjpeg|metadata.throughput_mbps_estimate`
-- `overlay_lag_proxy_ms_estimate`
+If frontend shows reconnect loops:
 
-Periodic backend metric logs can be tuned with:
+- Confirm backend health endpoint responds.
+- Confirm frontend `VITE_BACKEND_BASE_URL` matches backend port.
+- Check browser console for websocket connection errors.
 
-```bash
-METRICS_LOG_INTERVAL_SEC=10 LOG_LEVEL=INFO .venv/bin/python -m uvicorn backend.app.server:app --host 127.0.0.1 --port 8000
-```
+If metadata count stays zero:
+
+- Confirm frames are being ingested by owner process.
+- In plugin-empty mode, this is expected until first frame ingestion.
+- Reinstall backend requirements if websocket dependency is missing.
+
+If playback feels choppy:
+
+- Lower profile (`STREAM_PROFILE=low`) or lower frame dimensions/fps.
+- Inspect `/health` fields:
+  - `capture_fps_estimate`
+  - `latest_frame_age_ms`
+  - `delivery` throughput metrics
+  - `overlay_lag_proxy_ms_estimate`
+
+## Version
+
+Current local baseline: plugin-first runtime with synchronized overlay diagnostics and validation tooling.
