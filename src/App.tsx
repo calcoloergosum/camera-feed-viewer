@@ -300,55 +300,6 @@ function App() {
 
   return (
     <main className="app-shell">
-      <header className="hero">
-        <p className="kicker">React + PixiJS composition</p>
-        <h1>Live Camera Overlay Console</h1>
-        <p>
-          Bottom layer is compressed video. Top layer is GPU-rendered metadata
-          received over a backend WebSocket stream.
-        </p>
-      </header>
-
-      <section className="control-strip" aria-label="camera and feed controls">
-        <button
-          type="button"
-          className="action-btn"
-          onClick={() => setFeedEnabled((current) => !current)}
-        >
-          {feedEnabled ? 'Stop feed' : 'Start feed'}
-        </button>
-        <div className="status-pill">
-          Backend feed: <strong>{effectiveFeedStatus}</strong>
-        </div>
-        <div className="status-pill">
-          Metadata: <strong>{connectionState}</strong>
-        </div>
-        <div className="status-pill">
-          Reconnect attempts: <strong>{effectiveReconnectAttempt}</strong>
-        </div>
-      </section>
-
-      {effectiveFeedError && <p className="error-banner">{effectiveFeedError}</p>}
-
-      <section className="diagnostics-grid" aria-label="connection diagnostics">
-        <article>
-          <h2>Backend URL</h2>
-          <p>{BACKEND_BASE_URL}</p>
-        </article>
-        <article>
-          <h2>Last successful frame</h2>
-          <p>{formatLastSeen(lastFrameAtMs)}</p>
-        </article>
-        <article>
-          <h2>Next retry in</h2>
-          <p>{effectiveRetryCountdown === null ? 'N/A' : `${effectiveRetryCountdown}s`}</p>
-        </article>
-        <article>
-          <h2>Sync window</h2>
-          <p>{`±${SYNC_TOLERANCE_MS.toFixed(0)} ms (max age ${SYNC_MAX_AGE_MS.toFixed(0)} ms)`}</p>
-        </article>
-      </section>
-
       <section className="stage-wrap">
         <div className="stage" role="img" aria-label="live camera with overlays">
           <img
@@ -377,29 +328,119 @@ function App() {
         </div>
       </section>
 
-      <section className="metrics-grid" aria-label="stream metrics">
-        <article>
-          <h2>Overlay render fps</h2>
-          <p>{overlayFps.toFixed(1)}</p>
-        </article>
-        <article>
-          <h2>Metadata frames received</h2>
-          <p>{receivedFrames}</p>
-        </article>
-        <article>
-          <h2>Metadata frames dropped</h2>
-          <p>{droppedFrames}</p>
-        </article>
-        <article>
-          <h2>Sync lag</h2>
-          <p>{overlayLagMs === null ? 'N/A' : `${overlayLagMs.toFixed(0)} ms`}</p>
-        </article>
-      </section>
+      <aside className="hud-panels" aria-label="overlay controls">
+        <details className="hud-panel" aria-label="feed controls and status">
+          <summary title="Feed controls" aria-label="Feed controls">
+            <svg
+              className="hud-icon-svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              aria-hidden="true"
+            >
+              <path
+                d="M4 8H20M4 16H20M8 5V11M16 13V19"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+              <circle cx="8" cy="12" r="2.2" fill="currentColor" />
+              <circle cx="16" cy="12" r="2.2" fill="currentColor" />
+            </svg>
+          </summary>
 
-      <footer className="footnote">
-        Camera frames are sourced from backend MJPEG (30fps target). Metadata is sourced from
-        backend WebSocket stream.
-      </footer>
+          <div className="hud-panel-body">
+            <h2>Feed Controls</h2>
+            <section className="control-strip" aria-label="camera and feed controls">
+              <button
+                type="button"
+                className="action-btn"
+                onClick={() => setFeedEnabled((current) => !current)}
+              >
+                {feedEnabled ? 'Stop feed' : 'Start feed'}
+              </button>
+              <div className="status-pill">
+                Backend feed: <strong>{effectiveFeedStatus}</strong>
+              </div>
+              <div className="status-pill">
+                Metadata: <strong>{connectionState}</strong>
+              </div>
+              <div className="status-pill">
+                Reconnect attempts: <strong>{effectiveReconnectAttempt}</strong>
+              </div>
+            </section>
+
+            {effectiveFeedError && <p className="error-banner">{effectiveFeedError}</p>}
+          </div>
+        </details>
+
+        <details className="hud-panel" aria-label="testing diagnostics">
+          <summary title="Testing diagnostics" aria-label="Testing diagnostics">
+            <svg
+              className="hud-icon-svg"
+              viewBox="0 0 24 24"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              aria-hidden="true"
+            >
+              <path
+                d="M5 19V11M11 19V7M17 19V14"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+              />
+              <path
+                d="M4 19H20"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+              />
+            </svg>
+          </summary>
+
+          <div className="hud-panel-body">
+            <h2>Testing Diagnostics</h2>
+            <section className="diagnostics-grid" aria-label="connection diagnostics">
+              <article>
+                <h3>Backend URL</h3>
+                <p>{BACKEND_BASE_URL}</p>
+              </article>
+              <article>
+                <h3>Last successful frame</h3>
+                <p>{formatLastSeen(lastFrameAtMs)}</p>
+              </article>
+              <article>
+                <h3>Next retry in</h3>
+                <p>{effectiveRetryCountdown === null ? 'N/A' : `${effectiveRetryCountdown}s`}</p>
+              </article>
+              <article>
+                <h3>Sync window</h3>
+                <p>{`+-${SYNC_TOLERANCE_MS.toFixed(0)} ms (max age ${SYNC_MAX_AGE_MS.toFixed(0)} ms)`}</p>
+              </article>
+            </section>
+
+            <section className="metrics-grid" aria-label="stream metrics">
+              <article>
+                <h3>Overlay render fps</h3>
+                <p>{overlayFps.toFixed(1)}</p>
+              </article>
+              <article>
+                <h3>Metadata frames received</h3>
+                <p>{receivedFrames}</p>
+              </article>
+              <article>
+                <h3>Metadata frames dropped</h3>
+                <p>{droppedFrames}</p>
+              </article>
+              <article>
+                <h3>Sync lag</h3>
+                <p>{overlayLagMs === null ? 'N/A' : `${overlayLagMs.toFixed(0)} ms`}</p>
+              </article>
+            </section>
+          </div>
+        </details>
+      </aside>
     </main>
   )
 }
