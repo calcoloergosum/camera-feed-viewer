@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -14,7 +17,6 @@ from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .frame_store import FrameStore
-from .metadata_source import build_overlay_payload_with_frame_context
 from .telemetry import DeliveryTelemetry
 from .webrtc_runtime import WebRtcSessionManager
 
@@ -113,6 +115,9 @@ class PluginRuntime:
             max_sessions=settings.webrtc_max_sessions,
         )
         self.last_metrics_log_time = 0.0
+        self._latest_metadata_payload: dict[str, Any] | None = None
+        self._metadata_payload_lock = Lock()
+        self._last_invalid_metadata_log_time = 0.0
 
     def on_camera_frame(
         self,
@@ -149,6 +154,46 @@ class PluginRuntime:
 
         self.maybe_log_metrics(time.perf_counter())
         return next_seq
+
+    def on_metadata_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Store latest overlay payload provided by external owner and return stored snapshot."""
+
+        snapshot = copy.deepcopy(payload)
+        with self._metadata_payload_lock:
+            self._latest_metadata_payload = snapshot
+        return copy.deepcopy(snapshot)
+
+    def _read_metadata_payload(self) -> dict[str, Any] | None:
+        with self._metadata_payload_lock:
+            if self._latest_metadata_payload is None:
+                return None
+            return copy.deepcopy(self._latest_metadata_payload)
+
+    def _is_valid_overlay_payload(self, payload: dict[str, Any]) -> bool:
+        required_numeric_fields = [
+            "timestampMs",
+            "serverTimestampMs",
+            "frameSeq",
+            "sourceWidth",
+            "sourceHeight",
+        ]
+        for field in required_numeric_fields:
+            value = payload.get(field)
+            if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                return False
+
+        return isinstance(payload.get("items"), list)
+
+    def _maybe_log_invalid_overlay_payload(self, payload: dict[str, Any]) -> None:
+        now = time.perf_counter()
+        if now - self._last_invalid_metadata_log_time < 1.0:
+            return
+
+        self._last_invalid_metadata_log_time = now
+        self.logger.warning(
+            "invalid_metadata_payload keys=%s",
+            sorted(payload.keys()),
+        )
 
     def maybe_log_metrics(self, now: float) -> None:
         if self.settings.metrics_log_interval_sec <= 0:
@@ -281,22 +326,24 @@ class PluginRuntime:
                     await asyncio.sleep(0.02)
                     continue
 
-                reference_timestamp_ms = snapshot.timestamp_ms
-                server_timestamp_ms = time.time() * 1000.0
+                payload = self._read_metadata_payload()
+                if payload is None:
+                    await asyncio.sleep(0.02)
+                    continue
 
-                payload = build_overlay_payload_with_frame_context(
-                    timestamp_ms=reference_timestamp_ms,
-                    source_width=snapshot.width,
-                    source_height=snapshot.height,
-                    frame_seq=snapshot.seq,
-                    server_timestamp_ms=server_timestamp_ms,
-                )
+                if not self._is_valid_overlay_payload(payload):
+                    self._maybe_log_invalid_overlay_payload(payload)
+                    await asyncio.sleep(0.02)
+                    continue
+
                 await websocket.send_json(payload)
                 payload_size = len(json.dumps(payload, separators=(",", ":")))
+                payload_timestamp_ms = float(cast(Any, payload["timestampMs"]))
+                payload_server_timestamp_ms = float(cast(Any, payload["serverTimestampMs"]))
                 self.telemetry.update_metadata(
                     now=time.perf_counter(),
                     payload_bytes=payload_size,
-                    frame_skew_ms=max(0.0, server_timestamp_ms - reference_timestamp_ms),
+                    frame_skew_ms=max(0.0, payload_server_timestamp_ms - payload_timestamp_ms),
                 )
 
                 elapsed = time.perf_counter() - start

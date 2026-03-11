@@ -126,6 +126,12 @@ External camera owner calls:
 on_camera_frame(frame, seq=None, timestamp_ms=None, stream_id="default")
 ```
 
+External metadata owner calls:
+
+```python
+on_metadata_payload(payload)
+```
+
 Contract details:
 
 - `frame`: RGB `numpy.ndarray`, shape `(height, width, 3)`.
@@ -136,11 +142,21 @@ Contract details:
 Get callback from backend runtime:
 
 ```python
-from backend.app.plugin_api import get_frame_callback
+from backend.app.plugin_api import get_frame_callback, get_metadata_callback
 from backend.app.server import app
 
 frame_callback = get_frame_callback(app)
+metadata_callback = get_metadata_callback(app)
 ```
+
+Metadata payload must include:
+
+- `timestampMs`
+- `serverTimestampMs`
+- `frameSeq`
+- `sourceWidth`
+- `sourceHeight`
+- `items`
 
 ## Synchronization Contract
 
@@ -159,6 +175,8 @@ frame_callback = get_frame_callback(app)
 - `serverTimestampMs`
 - `frameSeq`
 - `items`
+
+Metadata messages are emitted only after a frame has been ingested and at least one metadata payload has been provided through `on_metadata_payload(payload)`.
 
 Frontend uses these fields to align metadata to the current video timeline and choose the nearest valid overlay frame within configurable tolerance and max-age windows.
 
