@@ -44,7 +44,7 @@ The project delivers a React + PixiJS frontend and a FastAPI backend where camer
 - `backend/app/`: FastAPI runtime, frame store, telemetry, plugin API.
 - `backend/scripts/`: harness, smoke check, sync validator, benchmark.
 
-## Quick Start
+## Runbook
 
 ## 1) Frontend
 
