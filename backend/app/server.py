@@ -6,21 +6,36 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response
+from pydantic import BaseModel
 
 from .frame_store import FrameStore
 from .metadata_source import build_overlay_payload_with_frame_context
 from .telemetry import DeliveryTelemetry
+from .webrtc_runtime import WebRtcSessionManager
 
 PROFILE_PRESETS = {
     "low": {"width": 960, "height": 540, "fps": 24, "jpeg_quality": 70},
     "balanced": {"width": 1280, "height": 720, "fps": 30, "jpeg_quality": 75},
     "high": {"width": 1920, "height": 1080, "fps": 30, "jpeg_quality": 82},
 }
+
+
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 @dataclass(frozen=True)
@@ -31,6 +46,8 @@ class AppSettings:
     stream_fps: int
     jpeg_quality: int
     metadata_fps: int
+    frame_jpeg_enabled: bool
+    webrtc_max_sessions: int
     metrics_log_interval_sec: int
     log_level: str
 
@@ -49,9 +66,23 @@ class AppSettings:
             stream_fps=max(1, min(60, int(os.getenv("STREAM_FPS", str(profile["fps"]))))),
             jpeg_quality=max(40, min(95, int(os.getenv("JPEG_QUALITY", str(profile["jpeg_quality"]))))),
             metadata_fps=max(1, min(30, int(os.getenv("METADATA_FPS", "10")))),
+            frame_jpeg_enabled=_read_bool_env("FRAME_JPEG_ENABLED", True),
+            webrtc_max_sessions=max(1, min(32, int(os.getenv("WEBRTC_MAX_SESSIONS", "6")))),
             metrics_log_interval_sec=max(0, int(os.getenv("METRICS_LOG_INTERVAL_SEC", "10"))),
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         )
+
+
+class WebRtcOfferRequest(BaseModel):
+    sdp: str
+    type: Literal["offer"]
+    peerId: str | None = None
+
+
+class WebRtcOfferResponse(BaseModel):
+    peerId: str
+    sdp: str
+    type: Literal["answer"]
 
 
 class PluginRuntime:
@@ -73,6 +104,14 @@ class PluginRuntime:
             telemetry if telemetry is not None else DeliveryTelemetry(metadata_target_fps=settings.metadata_fps)
         )
         self.logger = logging.getLogger(logger_name)
+        self.webrtc = WebRtcSessionManager(
+            frame_store=self.frame_store,
+            logger=self.logger,
+            target_fps=settings.stream_fps,
+            default_width=settings.frame_width,
+            default_height=settings.frame_height,
+            max_sessions=settings.webrtc_max_sessions,
+        )
         self.last_metrics_log_time = 0.0
 
     def on_camera_frame(
@@ -98,6 +137,7 @@ class PluginRuntime:
             timestamp_ms=timestamp_ms,
             stream_id=stream_id,
         )
+        self.webrtc.push_frame(frame)
 
         if next_seq <= previous_snapshot.seq:
             self.logger.warning(
@@ -125,7 +165,8 @@ class PluginRuntime:
         capture_fps = snapshot.capture_fps_estimate
         delivery = self.telemetry.snapshot()
         snapshot_delivery = delivery["snapshot"]
-        mjpeg = delivery["mjpeg"]
+        webrtc = delivery["webrtc"]
+        webrtc_runtime = self.webrtc.stats()
         metadata = delivery["metadata"]
 
         frame_age_ms = 0.0
@@ -134,17 +175,25 @@ class PluginRuntime:
 
         read_ms = snapshot.capture_read_ms_estimate
         encode_ms = snapshot.capture_encode_ms_estimate
+        snapshot_mbps = float(snapshot_delivery["throughput_mbps_estimate"])
+        metadata_mbps = float(metadata["throughput_mbps_estimate"])
+        network_load_mbps = snapshot_mbps + metadata_mbps
+        track_drop_count = int(cast(Any, webrtc_runtime.get("track_drop_count", 0)))
+        track_frames_emitted_total = int(cast(Any, webrtc_runtime.get("track_frames_emitted_total", 0)))
 
         self.logger.info(
-            "metrics frame_seq=%s capture_fps=%.2f frame_age_ms=%.2f capture_read_ms=%.2f capture_encode_ms=%.2f snapshot_mbps=%.2f mjpeg_mbps=%.2f metadata_mbps=%.2f overlay_lag_proxy_ms=%.2f",
+            "metrics frame_seq=%s capture_fps=%.2f frame_age_ms=%.2f capture_read_ms=%.2f capture_encode_ms=%.2f snapshot_mbps=%.2f webrtc_sessions=%s webrtc_track_drops=%s webrtc_frames_emitted_total=%s metadata_mbps=%.2f network_load_mbps=%.2f overlay_lag_proxy_ms=%.2f",
             frame_seq,
             capture_fps,
             frame_age_ms,
             read_ms,
             encode_ms,
-            float(snapshot_delivery["throughput_mbps_estimate"]),
-            float(mjpeg["throughput_mbps_estimate"]),
-            float(metadata["throughput_mbps_estimate"]),
+            snapshot_mbps,
+            int(webrtc["active_sessions"]),
+            track_drop_count,
+            track_frames_emitted_total,
+            metadata_mbps,
+            network_load_mbps,
             float(metadata["overlay_lag_proxy_ms_estimate"]),
         )
 
@@ -157,6 +206,7 @@ class PluginRuntime:
         width = frame_snapshot.width
         height = frame_snapshot.height
 
+        self.telemetry.set_webrtc_active_sessions(self.webrtc.active_session_count())
         delivery = self.telemetry.snapshot()
         has_frame = frame_timestamp_ms > 0 and width > 0 and height > 0
 
@@ -173,6 +223,10 @@ class PluginRuntime:
             "status": "ok" if has_frame else "waiting_for_frames",
             "stream_profile": self.settings.stream_profile,
             "profile_presets": PROFILE_PRESETS,
+            "diagnostics": {
+                "frame_jpeg_enabled": self.settings.frame_jpeg_enabled,
+                "frame_jpeg_path": "/frame.jpg" if self.settings.frame_jpeg_enabled else None,
+            },
             "camera_source": {
                 "requested_source": "external_callback",
                 "active_source": "external_callback",
@@ -181,6 +235,8 @@ class PluginRuntime:
             "frame_shape": [height, width, 3] if has_frame else None,
             "stream_fps_target": self.settings.stream_fps,
             "jpeg_quality": self.settings.jpeg_quality,
+            "webrtc": delivery["webrtc"],
+            "webrtc_runtime": self.webrtc.stats(),
             "frame_ready": has_frame,
             "capture_fps_estimate": round(capture_fps, 2),
             "capture_read_ms_estimate": round(read_ms, 2),
@@ -192,32 +248,24 @@ class PluginRuntime:
             "latest_frame_age_ms": None if frame_age_ms is None else round(frame_age_ms, 2),
         }
 
-    async def mjpeg_bytes(self, stream_fps: int) -> AsyncGenerator[bytes, None]:
-        frame_interval = 1.0 / stream_fps
-        self.telemetry.add_mjpeg_client()
+    async def create_webrtc_answer(
+        self,
+        sdp: str,
+        type_: str,
+        peer_id: str | None = None,
+    ) -> dict[str, str]:
+        answer = await self.webrtc.create_answer(offer_sdp=sdp, offer_type=type_, peer_id=peer_id)
+        self.telemetry.update_webrtc_offer(active_sessions=self.webrtc.active_session_count())
+        return answer
 
-        try:
-            while True:
-                start = time.perf_counter()
-                payload = self.frame_store.snapshot().jpeg
-                if payload is None:
-                    await asyncio.sleep(0.02)
-                    continue
+    async def close_webrtc_session(self, peer_id: str) -> bool:
+        closed = await self.webrtc.close_session(peer_id)
+        self.telemetry.set_webrtc_active_sessions(self.webrtc.active_session_count())
+        return closed
 
-                self.telemetry.update_mjpeg(now=time.perf_counter(), payload_bytes=len(payload))
-
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    + f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
-                    + payload
-                    + b"\r\n"
-                )
-
-                elapsed = time.perf_counter() - start
-                await asyncio.sleep(max(0.0, frame_interval - elapsed))
-        finally:
-            self.telemetry.remove_mjpeg_client()
+    async def close_all_webrtc_sessions(self) -> None:
+        await self.webrtc.close_all()
+        self.telemetry.set_webrtc_active_sessions(0)
 
     async def metadata_loop(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -283,12 +331,14 @@ def create_app(runtime: PluginRuntime | None = None, settings: AppSettings | Non
     @app.on_event("startup")
     def startup_plugin_runtime() -> None:
         active_runtime.logger.info(
-            "startup mode=plugin-callback profile=%s default_width=%s default_height=%s stream_fps=%s metadata_fps=%s",
+            "startup mode=plugin-callback profile=%s default_width=%s default_height=%s stream_fps=%s metadata_fps=%s frame_jpeg_enabled=%s webrtc_max_sessions=%s",
             active_settings.stream_profile,
             active_settings.frame_width,
             active_settings.frame_height,
             active_settings.stream_fps,
             active_settings.metadata_fps,
+            active_settings.frame_jpeg_enabled,
+            active_settings.webrtc_max_sessions,
         )
 
     @app.get("/health")
@@ -297,6 +347,12 @@ def create_app(runtime: PluginRuntime | None = None, settings: AppSettings | Non
 
     @app.get("/frame.jpg")
     def frame_jpeg() -> Response:
+        if not active_settings.frame_jpeg_enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="Frame diagnostics endpoint is disabled. Set FRAME_JPEG_ENABLED=1 to enable /frame.jpg.",
+            )
+
         snapshot = active_runtime.frame_store.snapshot()
         payload = snapshot.jpeg
         if payload is None:
@@ -317,22 +373,37 @@ def create_app(runtime: PluginRuntime | None = None, settings: AppSettings | Non
             },
         )
 
-    @app.get("/stream.mjpeg")
-    async def stream_mjpeg(fps: int | None = None) -> StreamingResponse:
-        stream_fps = active_settings.stream_fps if fps is None else max(1, min(60, fps))
+    @app.post("/webrtc/offer", response_model=WebRtcOfferResponse)
+    async def webrtc_offer(payload: WebRtcOfferRequest) -> WebRtcOfferResponse:
+        try:
+            answer = await active_runtime.create_webrtc_answer(
+                sdp=payload.sdp,
+                type_=payload.type,
+                peer_id=payload.peerId,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
 
-        return StreamingResponse(
-            active_runtime.mjpeg_bytes(stream_fps),
-            media_type="multipart/x-mixed-replace; boundary=frame",
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+        return WebRtcOfferResponse(
+            peerId=answer["peerId"],
+            sdp=answer["sdp"],
+            type="answer",
         )
+
+    @app.delete("/webrtc/{peer_id}")
+    async def close_webrtc_peer(peer_id: str) -> dict[str, object]:
+        closed = await active_runtime.close_webrtc_session(peer_id)
+        return {"status": "closed" if closed else "not_found", "peerId": peer_id}
 
     @app.websocket("/ws/metadata")
     async def websocket_metadata(websocket: WebSocket) -> None:
         await active_runtime.metadata_loop(websocket)
 
     @app.on_event("shutdown")
-    def shutdown_plugin_runtime() -> None:
+    async def shutdown_plugin_runtime() -> None:
+        await active_runtime.close_all_webrtc_sessions()
         active_runtime.logger.info("shutdown mode=plugin-callback")
 
     return app

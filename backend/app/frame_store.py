@@ -11,6 +11,7 @@ from PIL import Image
 
 @dataclass
 class FrameSnapshot:
+    frame: Any | None
     jpeg: bytes | None
     seq: int
     perf_time: float
@@ -28,6 +29,7 @@ class FrameStore:
         self._jpeg_quality = jpeg_quality
         self._lock = Lock()
 
+        self._latest_frame: Any | None = None
         self._latest_jpeg: bytes | None = None
         self._latest_frame_seq = 0
         self._latest_frame_time = 0.0
@@ -76,6 +78,8 @@ class FrameStore:
     ) -> int:
         width, height = self._validate_frame(frame)
 
+        stored_frame = frame.copy() if hasattr(frame, "copy") else frame
+
         encode_started = time.perf_counter()
         payload = self._encode_jpeg(frame)
         encode_elapsed_ms = (time.perf_counter() - encode_started) * 1000.0
@@ -88,6 +92,7 @@ class FrameStore:
 
             next_seq = self._latest_frame_seq + 1 if seq is None else int(seq)
 
+            self._latest_frame = stored_frame
             self._latest_jpeg = payload
             self._latest_frame_seq = next_seq
             self._latest_frame_time = now
@@ -105,6 +110,7 @@ class FrameStore:
     def snapshot(self) -> FrameSnapshot:
         with self._lock:
             return FrameSnapshot(
+                frame=self._latest_frame,
                 jpeg=self._latest_jpeg,
                 seq=self._latest_frame_seq,
                 perf_time=self._latest_frame_time,

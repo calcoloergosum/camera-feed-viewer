@@ -11,6 +11,12 @@ const DEFAULT_VIDEO_SIZE = {
 
 type FeedStatus = 'idle' | 'connecting' | 'ready' | 'error'
 
+interface WebRtcOfferResponse {
+  peerId: string
+  sdp: string
+  type: 'answer'
+}
+
 const BACKEND_BASE_URL =
   (import.meta.env.VITE_BACKEND_BASE_URL as string | undefined)?.replace(/\/$/, '') ||
   'http://127.0.0.1:8000'
@@ -47,11 +53,56 @@ const formatLastSeen = (timestampMs: number | null) => {
   return new Date(timestampMs).toLocaleTimeString()
 }
 
+const waitForIceGatheringComplete = async (peerConnection: RTCPeerConnection) => {
+  if (peerConnection.iceGatheringState === 'complete') {
+    return
+  }
+
+  await new Promise<void>((resolve) => {
+    const timeoutId = window.setTimeout(() => {
+      peerConnection.removeEventListener('icegatheringstatechange', handleStateChange)
+      resolve()
+    }, 2000)
+
+    const handleStateChange = () => {
+      if (peerConnection.iceGatheringState !== 'complete') {
+        return
+      }
+
+      window.clearTimeout(timeoutId)
+      peerConnection.removeEventListener('icegatheringstatechange', handleStateChange)
+      resolve()
+    }
+
+    peerConnection.addEventListener('icegatheringstatechange', handleStateChange)
+  })
+}
+
+const parseWebRtcOfferResponse = (payload: unknown): WebRtcOfferResponse | null => {
+  if (!payload || typeof payload !== 'object') {
+    return null
+  }
+
+  const value = payload as Record<string, unknown>
+  if (
+    typeof value.peerId !== 'string' ||
+    typeof value.sdp !== 'string' ||
+    value.type !== 'answer'
+  ) {
+    return null
+  }
+
+  return {
+    peerId: value.peerId,
+    sdp: value.sdp,
+    type: 'answer',
+  }
+}
+
 function App() {
   const [feedEnabled, setFeedEnabled] = useState(true)
   const [feedStatus, setFeedStatus] = useState<FeedStatus>('connecting')
   const [feedError, setFeedError] = useState<string | null>(null)
-  const [feedNonce, setFeedNonce] = useState(0)
   const [reconnectAttempt, setReconnectAttempt] = useState(0)
   const [nextRetryAtMs, setNextRetryAtMs] = useState<number | null>(null)
   const [lastFrameAtMs, setLastFrameAtMs] = useState<number | null>(null)
@@ -61,7 +112,50 @@ function App() {
   const [overlayFps, setOverlayFps] = useState(0)
   const [retryCountdownSeconds, setRetryCountdownSeconds] = useState<number | null>(null)
 
-  const imageRef = useRef<HTMLImageElement | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
+  const activePeerIdRef = useRef<string | null>(null)
+  const mediaClockBaseRef = useRef<{ epochMs: number; mediaMs: number } | null>(null)
+
+  const closePeerConnection = (notifyBackend: boolean) => {
+    const peerConnection = peerConnectionRef.current
+    peerConnectionRef.current = null
+    if (peerConnection) {
+      peerConnection.ontrack = null
+      peerConnection.onconnectionstatechange = null
+      peerConnection.close()
+    }
+
+    const peerId = activePeerIdRef.current
+    activePeerIdRef.current = null
+    if (notifyBackend && peerId) {
+      void fetch(`${BACKEND_BASE_URL}/webrtc/${encodeURIComponent(peerId)}`, {
+        method: 'DELETE',
+      }).catch(() => {
+        // Best-effort session cleanup; backend timeout handling is authoritative.
+      })
+    }
+
+    const video = videoRef.current
+    if (video) {
+      video.pause()
+      video.srcObject = null
+    }
+
+    mediaClockBaseRef.current = null
+  }
+
+  const syncMediaClockBase = () => {
+    const video = videoRef.current
+    if (!video) {
+      return
+    }
+
+    mediaClockBaseRef.current = {
+      epochMs: Date.now(),
+      mediaMs: video.currentTime * 1000,
+    }
+  }
 
   useEffect(() => {
     if (!feedEnabled) {
@@ -135,6 +229,8 @@ function App() {
         return
       }
 
+      closePeerConnection(true)
+
       const cappedPower = Math.min(attempt, 6)
       const backoffDelay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** cappedPower)
       const jitter = Math.floor(Math.random() * 250)
@@ -148,11 +244,11 @@ function App() {
 
       reconnectTimer = window.setTimeout(() => {
         attempt = nextAttempt
-        void startConnection()
+        void connectWebRtc()
       }, retryDelay)
     }
 
-    const startConnection = async () => {
+    const connectWebRtc = async () => {
       if (cancelled) {
         return
       }
@@ -167,14 +263,91 @@ function App() {
           return
         }
 
-        setFeedNonce((current) => current + 1)
-        setFeedStatus('ready')
-        setFeedError(null)
-        setReconnectAttempt(0)
-        setNextRetryAtMs(null)
-        setLastFrameAtMs(Date.now())
-        startHealthPolling()
-        return
+        closePeerConnection(false)
+
+        try {
+          const peerConnection = new RTCPeerConnection()
+          peerConnectionRef.current = peerConnection
+          peerConnection.addTransceiver('video', { direction: 'recvonly' })
+
+          peerConnection.ontrack = (event) => {
+            if (cancelled) {
+              return
+            }
+
+            const videoElement = videoRef.current
+            if (!videoElement) {
+              return
+            }
+
+            const [stream] = event.streams
+            videoElement.srcObject = stream ?? new MediaStream([event.track])
+            void videoElement.play().catch(() => {
+              // Browser autoplay policy may require user interaction in some environments.
+            })
+
+            setFeedStatus('ready')
+            setFeedError(null)
+            setReconnectAttempt(0)
+            setNextRetryAtMs(null)
+            setLastFrameAtMs(Date.now())
+            startHealthPolling()
+          }
+
+          peerConnection.onconnectionstatechange = () => {
+            if (cancelled) {
+              return
+            }
+
+            const state = peerConnection.connectionState
+            if (state === 'failed' || state === 'disconnected' || state === 'closed') {
+              clearTimers()
+              scheduleReconnect(`WebRTC connection ${state}. Reconnecting automatically...`)
+            }
+          }
+
+          const offer = await peerConnection.createOffer()
+          await peerConnection.setLocalDescription(offer)
+          await waitForIceGatheringComplete(peerConnection)
+
+          const localDescription = peerConnection.localDescription
+          if (!localDescription?.sdp) {
+            throw new Error('WebRTC local offer is unavailable')
+          }
+
+          const response = await fetch(`${BACKEND_BASE_URL}/webrtc/offer`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              sdp: localDescription.sdp,
+              type: localDescription.type,
+              peerId: activePeerIdRef.current,
+            }),
+          })
+
+          if (!response.ok) {
+            throw new Error(`Backend signaling failed: HTTP ${response.status}`)
+          }
+
+          const answerPayload = parseWebRtcOfferResponse(await response.json())
+          if (!answerPayload) {
+            throw new Error('Backend signaling payload is invalid')
+          }
+
+          activePeerIdRef.current = answerPayload.peerId
+          await peerConnection.setRemoteDescription({
+            sdp: answerPayload.sdp,
+            type: answerPayload.type,
+          })
+
+          return
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'Unknown signaling failure'
+          scheduleReconnect(`Unable to establish WebRTC session. ${detail}`)
+          return
+        }
       }
 
       scheduleReconnect(
@@ -182,11 +355,12 @@ function App() {
       )
     }
 
-    void startConnection()
+    void connectWebRtc()
 
     return () => {
       cancelled = true
       clearTimers()
+      closePeerConnection(true)
     }
   }, [feedEnabled, connectionCycle])
 
@@ -219,15 +393,20 @@ function App() {
   const effectiveReconnectAttempt = feedEnabled ? reconnectAttempt : 0
   const effectiveRetryCountdown = feedEnabled ? retryCountdownSeconds : null
 
-  const streamUrl = feedEnabled
-    ? `${BACKEND_BASE_URL}/stream.mjpeg?fps=30&nonce=${feedNonce}`
-    : undefined
-
   useEffect(() => {
     let frameId = 0
 
     const tick = () => {
-      setVideoTimeMs(Date.now())
+      const video = videoRef.current
+      const mediaClockBase = mediaClockBaseRef.current
+
+      if (video && mediaClockBase) {
+        const mediaNowMs = video.currentTime * 1000
+        const estimatedEpochMs = mediaClockBase.epochMs + (mediaNowMs - mediaClockBase.mediaMs)
+        setVideoTimeMs(Number.isFinite(estimatedEpochMs) ? estimatedEpochMs : Date.now())
+      } else {
+        setVideoTimeMs(Date.now())
+      }
 
       frameId = requestAnimationFrame(tick)
     }
@@ -259,26 +438,24 @@ function App() {
     return Math.max(0, videoTimeMs - synchronizedFrame.timestampMs)
   }, [synchronizedFrame, videoTimeMs])
 
-  const handleMetadataLoaded = () => {
-    const element = imageRef.current
-    if (!element || !element.naturalWidth || !element.naturalHeight) {
+  const handleVideoMetadataLoaded = () => {
+    const element = videoRef.current
+    if (!element || !element.videoWidth || !element.videoHeight) {
       return
     }
 
     setVideoSize((current) => {
-      if (
-        current.width === element.naturalWidth &&
-        current.height === element.naturalHeight
-      ) {
+      if (current.width === element.videoWidth && current.height === element.videoHeight) {
         return current
       }
 
       return {
-        width: element.naturalWidth,
-        height: element.naturalHeight,
+        width: element.videoWidth,
+        height: element.videoHeight,
       }
     })
 
+    syncMediaClockBase()
     setLastFrameAtMs(Date.now())
   }
 
@@ -288,9 +465,7 @@ function App() {
     }
 
     setFeedStatus('error')
-    setFeedError(
-      `Stream decode failed. Reconnecting to ${BACKEND_BASE_URL}...`,
-    )
+    setFeedError(`WebRTC video playback failed. Reconnecting to ${BACKEND_BASE_URL}...`)
     setConnectionCycle((current) => current + 1)
   }
 
@@ -302,12 +477,14 @@ function App() {
     <main className="app-shell">
       <section className="stage-wrap">
         <div className="stage" role="img" aria-label="live camera with overlays">
-          <img
-            ref={imageRef}
+          <video
+            ref={videoRef}
             className="camera-video"
-            src={streamUrl}
-            alt="Backend camera stream"
-            onLoad={handleMetadataLoaded}
+            autoPlay
+            muted
+            playsInline
+            onLoadedMetadata={handleVideoMetadataLoaded}
+            onPlaying={syncMediaClockBase}
             onError={handleFeedError}
           />
           <OverlayCanvas

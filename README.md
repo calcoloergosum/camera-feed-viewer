@@ -2,7 +2,13 @@
 
 Plugin-first camera streaming platform with synchronized overlay rendering.
 
-The project delivers a React + PixiJS frontend and a FastAPI backend where camera ownership stays external to the API process. The backend serves JPEG snapshots, MJPEG stream delivery, and websocket metadata with sequence/timestamp context for sync.
+## Quickstart
+
+Launch Frontend: `npm run dev`
+
+Launch backend: `python -m backend.scripts.main`
+
+The project delivers a React + PixiJS frontend and a FastAPI backend where camera ownership stays external to the API process. The backend serves WebRTC video, JPEG diagnostic snapshots, and websocket metadata with sequence/timestamp context for sync.
 
 ## What This Delivers
 
@@ -18,15 +24,17 @@ The project delivers a React + PixiJS frontend and a FastAPI backend where camer
 
 1. External owner captures RGB frames.
 2. Owner pushes each frame into backend callback (`on_camera_frame`).
-3. Backend stores latest encoded JPEG and frame context (seq/timestamp/shape).
-4. Frontend reads `GET /stream.mjpeg` for video and `WS /ws/metadata` for overlays.
-5. Frontend sync selector matches metadata frame timing to video timeline.
+3. Backend stores latest frame context and serves WebRTC tracks with H.264-preferred codec negotiation.
+4. Frontend performs SDP offer/answer against backend WebRTC signaling and renders remote video track in `<video>`.
+5. Frontend reads `WS /ws/metadata` for overlays.
+6. Frontend sync selector matches metadata frame timing to video timeline.
 
 ### Core Interfaces
 
 - `GET /health`
-- `GET /frame.jpg`
-- `GET /stream.mjpeg`
+- `GET /frame.jpg` (diagnostics, optional)
+- `POST /webrtc/offer`
+- `DELETE /webrtc/{peer_id}`
 - `WS /ws/metadata`
 - `backend.app.plugin_api.get_frame_callback(...)`
 
@@ -82,8 +90,10 @@ Run backend API (plugin mode):
 Important behavior in plugin mode:
 
 - Backend does not own camera capture.
-- Before first frame ingestion, `/frame.jpg` returns `503`.
+- Before first frame ingestion, `/frame.jpg` returns `503` when enabled.
+- Set `FRAME_JPEG_ENABLED=0` to disable `/frame.jpg` in long-running WebRTC-only deployments.
 - Metadata websocket waits for first valid frame.
+- WebRTC signaling is available at `/webrtc/offer`.
 
 ## 3) Legacy Owner Harness (for local integration)
 
@@ -144,6 +154,24 @@ frame_callback = get_frame_callback(app)
 
 Frontend uses these fields to align metadata to the current video timeline and choose the nearest valid overlay frame within configurable tolerance and max-age windows.
 
+### WebRTC Signaling
+
+Frontend sends local offer SDP:
+
+`POST /webrtc/offer`
+
+Request body:
+
+- `sdp`
+- `type` (`offer`)
+- `peerId` (optional for reconnect)
+
+Response body:
+
+- `peerId`
+- `sdp`
+- `type` (`answer`)
+
 ## Stream Profiles And Env Tuning
 
 Profiles:
@@ -164,6 +192,7 @@ Common backend env overrides:
 - `FRAME_WIDTH`
 - `FRAME_HEIGHT`
 - `JPEG_QUALITY`
+- `FRAME_JPEG_ENABLED`
 - `METADATA_FPS`
 - `METRICS_LOG_INTERVAL_SEC`
 - `LOG_LEVEL`
@@ -182,12 +211,15 @@ Sync validation:
 ```bash
 .venv/bin/python backend/scripts/validate_sync.py --base-url http://127.0.0.1:8000 --samples 100 --probe-every 10 --jitter-ms 90 --burst-every 25 --burst-pause-ms 220
 .venv/bin/python backend/scripts/validate_sync.py --mode plugin-empty --base-url http://127.0.0.1:8000 --metadata-timeout 1.5
+.venv/bin/python backend/scripts/validate_sync.py --base-url http://127.0.0.1:8000 --probe-every 0
+.venv/bin/python backend/scripts/validate_sync.py --mode harness --base-url http://127.0.0.1:8000 --require-webrtc-active --min-webrtc-frames-pushed 20 --min-webrtc-frames-emitted 5
 ```
 
 Benchmarking:
 
 ```bash
-.venv/bin/python backend/scripts/benchmark_stream.py --base-url http://127.0.0.1:8000 --duration 20 --interval 0.02
+.venv/bin/python backend/scripts/benchmark_stream.py --base-url http://127.0.0.1:8000 --duration 20 --interval 0.25
+.venv/bin/python backend/scripts/benchmark_stream.py --base-url http://127.0.0.1:8000 --duration 15 --signaling-cycles 5
 ```
 
 Bytecode compile checks:
@@ -218,7 +250,7 @@ If frontend shows reconnect loops:
 
 - Confirm backend health endpoint responds.
 - Confirm frontend `VITE_BACKEND_BASE_URL` matches backend port.
-- Check browser console for websocket connection errors.
+- Check browser console for WebRTC signaling/connection errors.
 
 If metadata count stays zero:
 
@@ -234,6 +266,13 @@ If playback feels choppy:
   - `latest_frame_age_ms`
   - `delivery` throughput metrics
   - `overlay_lag_proxy_ms_estimate`
+  - `webrtc_runtime` counters (`media_pipeline`, `frames_pushed`, `track_frames_emitted_total`, `track_drop_count`)
+
+If `/frame.jpg` returns 404:
+
+- `FRAME_JPEG_ENABLED=0` is active and diagnostics endpoint is intentionally disabled.
+- Use `GET /health` for runtime state and WebRTC counters.
+- For sync runs in this mode, use `backend/scripts/validate_sync.py --probe-every 0`.
 
 ## Version
 

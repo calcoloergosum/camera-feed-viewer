@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# pyright: reportMissingImports=false, reportGeneralTypeIssues=false, reportAttributeAccessIssue=false
+
 import argparse
 import asyncio
 import json
@@ -12,6 +14,32 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import websockets
+
+try:
+    from aiortc import (
+        RTCPeerConnection as AiortcRTCPeerConnection,
+        RTCSessionDescription as AiortcRTCSessionDescription,
+    )
+
+    WEBRTC_VALIDATE_IMPORT_ERROR: Exception | None = None
+except Exception as error:  # pragma: no cover - dependency availability differs by environment
+    WEBRTC_VALIDATE_IMPORT_ERROR = error
+    AiortcRTCPeerConnection = Any
+    AiortcRTCSessionDescription = Any
+
+
+if WEBRTC_VALIDATE_IMPORT_ERROR is None:
+    RTCPeerConnectionType = AiortcRTCPeerConnection  # type: ignore[assignment]
+    RTCSessionDescriptionType = AiortcRTCSessionDescription  # type: ignore[assignment]
+else:
+
+    class RTCPeerConnectionType:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError(f"aiortc import failed: {WEBRTC_VALIDATE_IMPORT_ERROR}")
+
+    class RTCSessionDescriptionType:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise RuntimeError(f"aiortc import failed: {WEBRTC_VALIDATE_IMPORT_ERROR}")
 
 
 @dataclass
@@ -60,47 +88,201 @@ def fetch_health(base_url: str) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def frame_diagnostics_enabled(health: dict[str, Any]) -> bool:
+    diagnostics = health.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        return True
+
+    enabled = diagnostics.get("frame_jpeg_enabled")
+    if isinstance(enabled, bool):
+        return enabled
+
+    return True
+
+
+def _post_json(url: str, payload: dict[str, object], timeout_s: float) -> dict[str, object]:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=timeout_s) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _delete(url: str, timeout_s: float) -> None:
+    request = Request(url, method="DELETE")
+    with urlopen(request, timeout=timeout_s):
+        return
+
+
+async def _wait_for_ice_complete(peer_connection: Any, timeout_s: float = 2.0) -> None:
+    if peer_connection.iceGatheringState == "complete":
+        return
+
+    complete_event = asyncio.Event()
+
+    @peer_connection.on("icegatheringstatechange")
+    def on_ice_state_change() -> None:
+        if peer_connection.iceGatheringState == "complete":
+            complete_event.set()
+
+    try:
+        await asyncio.wait_for(complete_event.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return
+
+
+async def _wait_for_connection_settle(peer_connection: Any, timeout_s: float = 0.35) -> None:
+    if peer_connection.connectionState in {"connected", "failed", "closed"}:
+        return
+
+    settle_event = asyncio.Event()
+
+    @peer_connection.on("connectionstatechange")
+    def on_connection_state_change() -> None:
+        if peer_connection.connectionState in {"connected", "failed", "closed"}:
+            settle_event.set()
+
+    try:
+        await asyncio.wait_for(settle_event.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return
+
+
+async def open_webrtc_session(base_url: str) -> tuple[Any, str]:
+    if WEBRTC_VALIDATE_IMPORT_ERROR is not None:
+        raise RuntimeError(f"aiortc import failed: {WEBRTC_VALIDATE_IMPORT_ERROR}")
+
+    peer_connection = RTCPeerConnectionType()
+    peer_connection.addTransceiver("video", direction="recvonly")
+    offer = await peer_connection.createOffer()
+    await peer_connection.setLocalDescription(offer)
+    await _wait_for_ice_complete(peer_connection)
+
+    local_description = peer_connection.localDescription
+    if local_description is None or not local_description.sdp:
+        raise RuntimeError("local offer sdp unavailable")
+
+    answer_payload = await asyncio.to_thread(
+        _post_json,
+        f"{base_url}/webrtc/offer",
+        {
+            "sdp": local_description.sdp,
+            "type": local_description.type,
+        },
+        6.0,
+    )
+
+    answer_sdp = answer_payload.get("sdp")
+    answer_type = answer_payload.get("type")
+    peer_id = answer_payload.get("peerId")
+    if not isinstance(answer_sdp, str) or not answer_sdp.strip():
+        raise RuntimeError("backend answer missing sdp")
+    if answer_type != "answer":
+        raise RuntimeError(f"unexpected answer type={answer_type}")
+    if not isinstance(peer_id, str) or not peer_id.strip():
+        raise RuntimeError("backend answer missing peerId")
+
+    await peer_connection.setRemoteDescription(RTCSessionDescriptionType(sdp=answer_sdp, type="answer"))
+    return peer_connection, peer_id
+
+
+async def close_webrtc_session(base_url: str, peer_connection: Any, peer_id: str) -> None:
+    await _wait_for_connection_settle(peer_connection)
+    await peer_connection.close()
+    try:
+        await asyncio.to_thread(_delete, f"{base_url}/webrtc/{peer_id}", 4.0)
+    except Exception:
+        pass
+
+
 async def collect_sync_samples(
     ws_url: str,
     frame_url: str,
+    base_url: str,
     samples: int,
     probe_every: int,
     jitter_ms: float,
     burst_every: int,
     burst_pause_ms: float,
-) -> tuple[list[MetadataSample], list[FrameProbe]]:
+    hold_webrtc_session: bool,
+) -> tuple[list[MetadataSample], list[FrameProbe], str | None]:
     metadata_samples: list[MetadataSample] = []
     frame_probes: list[FrameProbe] = []
+    peer_connection: Any | None = None
+    peer_id: str | None = None
 
-    async with websockets.connect(ws_url) as socket:
-        for index in range(samples):
-            raw = await asyncio.wait_for(socket.recv(), timeout=3.0)
-            payload = json.loads(raw)
+    if hold_webrtc_session:
+        peer_connection, peer_id = await open_webrtc_session(base_url)
 
-            timestamp_ms = float(payload["timestampMs"])
-            server_timestamp_ms = float(payload["serverTimestampMs"])
-            seq = int(payload["frameSeq"])
+    try:
+        async with websockets.connect(ws_url) as socket:
+            for index in range(samples):
+                raw = await asyncio.wait_for(socket.recv(), timeout=3.0)
+                payload = json.loads(raw)
 
-            metadata_samples.append(
-                MetadataSample(
-                    seq=seq,
-                    timestamp_ms=timestamp_ms,
-                    server_timestamp_ms=server_timestamp_ms,
-                    received_at_ms=time.time() * 1000.0,
+                timestamp_ms = float(payload["timestampMs"])
+                server_timestamp_ms = float(payload["serverTimestampMs"])
+                seq = int(payload["frameSeq"])
+
+                metadata_samples.append(
+                    MetadataSample(
+                        seq=seq,
+                        timestamp_ms=timestamp_ms,
+                        server_timestamp_ms=server_timestamp_ms,
+                        received_at_ms=time.time() * 1000.0,
+                    )
                 )
-            )
 
-            if probe_every > 0 and (index + 1) % probe_every == 0:
-                probe = await asyncio.to_thread(fetch_frame_probe, frame_url, seq)
-                frame_probes.append(probe)
+                if probe_every > 0 and (index + 1) % probe_every == 0:
+                    probe = await asyncio.to_thread(fetch_frame_probe, frame_url, seq)
+                    frame_probes.append(probe)
 
-            if jitter_ms > 0:
-                await asyncio.sleep(random.uniform(0.0, jitter_ms) / 1000.0)
+                if jitter_ms > 0:
+                    await asyncio.sleep(random.uniform(0.0, jitter_ms) / 1000.0)
 
-            if burst_every > 0 and burst_pause_ms > 0 and (index + 1) % burst_every == 0:
-                await asyncio.sleep(burst_pause_ms / 1000.0)
+                if burst_every > 0 and burst_pause_ms > 0 and (index + 1) % burst_every == 0:
+                    await asyncio.sleep(burst_pause_ms / 1000.0)
+    finally:
+        if hold_webrtc_session and peer_connection is not None and peer_id is not None:
+            await close_webrtc_session(base_url, peer_connection, peer_id)
 
-    return metadata_samples, frame_probes
+    return metadata_samples, frame_probes, peer_id
+
+
+def assert_webrtc_runtime_activity(
+    base_url: str,
+    min_frames_pushed: int,
+    min_track_frames_emitted: int,
+    retries: int,
+    retry_delay_s: float,
+) -> dict[str, int | str]:
+    for attempt in range(max(1, retries)):
+        health = fetch_health(base_url)
+        runtime = health.get("webrtc_runtime")
+        if not isinstance(runtime, dict):
+            raise RuntimeError("health payload missing webrtc_runtime object")
+
+        frames_pushed = int(runtime.get("frames_pushed", 0))
+        track_frames_emitted_total = int(runtime.get("track_frames_emitted_total", 0))
+        media_pipeline = str(runtime.get("media_pipeline", "unknown"))
+
+        if frames_pushed >= min_frames_pushed and track_frames_emitted_total >= min_track_frames_emitted:
+            return {
+                "frames_pushed": frames_pushed,
+                "track_frames_emitted_total": track_frames_emitted_total,
+                "media_pipeline": media_pipeline,
+            }
+
+        if attempt < max(1, retries) - 1:
+            time.sleep(max(0.05, retry_delay_s))
+
+    raise RuntimeError(
+        "webrtc runtime activity below threshold "
+        f"(frames_pushed>={min_frames_pushed}, track_frames_emitted_total>={min_track_frames_emitted})"
+    )
 
 
 def summarize(metadata_samples: list[MetadataSample], frame_probes: list[FrameProbe]) -> dict[str, float | int]:
@@ -165,6 +347,7 @@ async def validate_plugin_empty_mode(base_url: str, metadata_timeout_s: float) -
     health = fetch_health(base_url)
     status = health.get("status")
     frame_ready = health.get("frame_ready")
+    diagnostics_enabled = frame_diagnostics_enabled(health)
     if status != "waiting_for_frames" or frame_ready is not False:
         raise RuntimeError(
             f"plugin-empty health mismatch status={status} frame_ready={frame_ready}"
@@ -176,10 +359,15 @@ async def validate_plugin_empty_mode(base_url: str, metadata_timeout_s: float) -
         with urlopen(request, timeout=3.0):
             pass
     except HTTPError as error:
-        if error.code != 503:
-            raise RuntimeError(f"plugin-empty expected 503 from /frame.jpg but got {error.code}")
+        expected_status = 503 if diagnostics_enabled else 404
+        if error.code != expected_status:
+            raise RuntimeError(
+                f"plugin-empty expected {expected_status} from /frame.jpg but got {error.code}"
+            )
     else:
-        raise RuntimeError("plugin-empty expected /frame.jpg to return 503 before frame ingestion")
+        if diagnostics_enabled:
+            raise RuntimeError("plugin-empty expected /frame.jpg to return 503 before frame ingestion")
+        raise RuntimeError("plugin-empty expected /frame.jpg to be disabled")
 
     ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/metadata"
     async with websockets.connect(ws_url) as socket:
@@ -189,7 +377,10 @@ async def validate_plugin_empty_mode(base_url: str, metadata_timeout_s: float) -
             print("Synchronization validation summary")
             print("- mode: plugin-empty")
             print("- health_waiting_for_frames: true")
-            print("- frame_endpoint_503_before_ingest: true")
+            if diagnostics_enabled:
+                print("- frame_endpoint_503_before_ingest: true")
+            else:
+                print("- frame_endpoint_disabled: true")
             print("- metadata_message_before_ingest: false")
             return
 
@@ -206,13 +397,27 @@ def main() -> None:
         help="harness validates live sequence/timestamps; plugin-empty validates pre-ingest waiting behavior",
     )
     parser.add_argument("--samples", type=int, default=120)
-    parser.add_argument("--probe-every", type=int, default=12)
+    parser.add_argument(
+        "--probe-every",
+        type=int,
+        default=12,
+        help="Frame probe cadence (0 disables /frame.jpg probes)",
+    )
     parser.add_argument("--jitter-ms", type=float, default=60.0)
     parser.add_argument("--burst-every", type=int, default=30)
     parser.add_argument("--burst-pause-ms", type=float, default=180.0)
     parser.add_argument("--metadata-timeout", type=float, default=2.0)
     parser.add_argument("--max-server-minus-frame-ms-p95", type=float, default=1200.0)
     parser.add_argument("--max-receive-minus-frame-ms-p95", type=float, default=2500.0)
+    parser.add_argument(
+        "--require-webrtc-active",
+        action="store_true",
+        help="Open a live WebRTC session during harness sync sampling and assert runtime counters",
+    )
+    parser.add_argument("--min-webrtc-frames-pushed", type=int, default=20)
+    parser.add_argument("--min-webrtc-frames-emitted", type=int, default=5)
+    parser.add_argument("--webrtc-runtime-retries", type=int, default=4)
+    parser.add_argument("--webrtc-runtime-retry-delay", type=float, default=0.2)
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -228,16 +433,26 @@ def main() -> None:
 
     ws_url = f"{base_url.replace('http://', 'ws://').replace('https://', 'wss://')}/ws/metadata"
     frame_url = f"{base_url}/frame.jpg"
+    health = fetch_health(base_url)
+    diagnostics_enabled = frame_diagnostics_enabled(health)
+    requested_probe_every = max(0, args.probe_every)
+    if requested_probe_every > 0 and not diagnostics_enabled:
+        raise RuntimeError(
+            "frame diagnostics are disabled but probe-every is > 0. "
+            "Set --probe-every 0 or enable FRAME_JPEG_ENABLED."
+        )
 
-    metadata_samples, frame_probes = asyncio.run(
+    metadata_samples, frame_probes, _peer_id = asyncio.run(
         collect_sync_samples(
             ws_url=ws_url,
             frame_url=frame_url,
+            base_url=base_url,
             samples=max(20, args.samples),
-            probe_every=max(1, args.probe_every),
+            probe_every=requested_probe_every,
             jitter_ms=max(0.0, args.jitter_ms),
             burst_every=max(0, args.burst_every),
             burst_pause_ms=max(0.0, args.burst_pause_ms),
+            hold_webrtc_session=args.require_webrtc_active,
         )
     )
 
@@ -260,6 +475,18 @@ def main() -> None:
             "receive-minus-frame lag p95 exceeded threshold "
             f"({metrics['metadata_receive_minus_frame_ms_p95']:.2f} > {args.max_receive_minus_frame_ms_p95:.2f})"
         )
+
+    if args.require_webrtc_active:
+        runtime_metrics = assert_webrtc_runtime_activity(
+            base_url=base_url,
+            min_frames_pushed=max(1, args.min_webrtc_frames_pushed),
+            min_track_frames_emitted=max(1, args.min_webrtc_frames_emitted),
+            retries=max(1, args.webrtc_runtime_retries),
+            retry_delay_s=max(0.05, args.webrtc_runtime_retry_delay),
+        )
+        print(f"- webrtc_runtime_frames_pushed: {runtime_metrics['frames_pushed']}")
+        print(f"- webrtc_runtime_track_frames_emitted_total: {runtime_metrics['track_frames_emitted_total']}")
+        print(f"- webrtc_runtime_media_pipeline: {runtime_metrics['media_pipeline']}")
 
 
 if __name__ == "__main__":
