@@ -1,6 +1,14 @@
-# Video Server
+# Camera feed viewer
 
-Plugin-first camera streaming platform with synchronized overlay rendering.
+Lightweight plugin-first camera streaming with synchronized overlay rendering.
+
+## Motivation
+
+- I wanted a realtime feedback viewer on my ML project, but existing camera streaming solutions (e.g. rerun) felt too heavylifting for my needs.
+- I wanted to utilize agentic AI techniques to help design and implement the system.
+- I wanted to learn more about WebRTC video delivery and synchronization techniques by building a custom solution from the ground up.
+- I wanted to build a reusable backend runtime with a clear plugin contract for ingesting frames from external camera owners, and a simple frontend that can render video plus synchronized overlays.
+- From here is written by code agents :P
 
 ## Quickstart
 
