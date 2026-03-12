@@ -25,8 +25,9 @@ export const selectSynchronizedFrame = (
     return null
   }
 
-  let best: OverlayFrame | null = null
-  let bestDistance = Number.POSITIVE_INFINITY
+  void toleranceMs
+
+  let latest: OverlayFrame | null = null
 
   for (const frame of frames) {
     const ageMs = videoTimeMs - frame.timestampMs
@@ -34,21 +35,10 @@ export const selectSynchronizedFrame = (
       continue
     }
 
-    const distance = Math.abs(frame.timestampMs - videoTimeMs)
-    if (distance > toleranceMs) {
-      continue
-    }
-
-    if (distance < bestDistance) {
-      best = frame
-      bestDistance = distance
-      continue
-    }
-
-    if (distance === bestDistance && best && frame.timestampMs > best.timestampMs) {
-      best = frame
+    if (!latest || frame.timestampMs > latest.timestampMs) {
+      latest = frame
     }
   }
 
-  return best
+  return latest
 }
